@@ -8,11 +8,11 @@ import logging
 
 # --- SETUP ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("OMR_Human_Eye")
+logger = logging.getLogger("OMR_Strict_Proctor")
 app = Flask(__name__)
 CORS(app)
 
-# --- HUMAN EYE CLASS (आंख) ---
+# --- HUMAN EYE (विजन) ---
 class HumanEye:
     def load_image(self, file_bytes) -> np.ndarray:
         try:
@@ -22,26 +22,19 @@ class HumanEye:
             return None
 
     def adjust_vision(self, img):
-        """
-        आंख की पुतली की तरह रौशनी सेट करना (Adaptive Vision)
-        """
-        # 1. ग्रेस्केल में बदलो
+        # 1. ग्रेस्केल
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
         # 2. CONTRAST BOOST (नीले पेन को गहरा काला बनाना)
-        # यह देखेगा कि इमेज में सबसे डार्क और लाइट पिक्सेल कौन से हैं और उन्हें फैला देगा
         gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-        # 3. ADAPTIVE THRESHOLD (छाया/Shadow हटाना)
-        # यह हर छोटे हिस्से (21x21 block) को अलग-अलग चेक करेगा
-        # 15 = Constant (Noise हटाने के लिए)
+        # 3. ADAPTIVE THRESHOLD (छाया हटाना - Strict Mode)
+        # Block Size 21, Constant 10 (Noise हटाने के लिए सख्त)
         thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                      cv2.THRESH_BINARY_INV, 21, 10)
-
         return gray, thresh
 
     def four_point_transform(self, image, pts):
-        # इमेज को सीधा करना (Perspective Transform)
         rect = np.zeros((4, 2), dtype="float32")
         s = pts.sum(axis=1)
         rect[0] = pts[np.argmin(s)]
@@ -60,24 +53,21 @@ class HumanEye:
         M = cv2.getPerspectiveTransform(rect, dst)
         return cv2.warpPerspective(image, M, (maxWidth, maxHeight))
 
-# --- HUMAN BRAIN CLASS (दिमाग) ---
+# --- HUMAN BRAIN (सख्त दिमाग) ---
 class HumanBrain:
     def __init__(self):
         self.eye = HumanEye()
 
     def think(self, img_bytes):
-        # 1. आंख से देखो
         img = self.eye.load_image(img_bytes)
         if img is None: return {"error": "Image Load Failed"}
 
-        # 2. विजन एडजस्ट करो (Shadow & Blue Pen Logic)
         gray, thresh = self.eye.adjust_vision(img)
 
-        # 3. पेपर का बॉर्डर ढूँढो
+        # पेपर ढूँढो
         cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts = imutils.grab_contours(cnts)
         docCnt = None
-        
         if len(cnts) > 0:
             cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
             for c in cnts:
@@ -88,31 +78,27 @@ class HumanBrain:
                     break
         
         if docCnt is not None:
-            warped = self.eye.four_point_transform(gray, docCnt.reshape(4, 2))
             thresh_warped = self.eye.four_point_transform(thresh, docCnt.reshape(4, 2))
         else:
-            warped = gray
             thresh_warped = thresh
 
-        # 4. गोले ढूँढो (Universal Bubble Hunting)
+        # गोले ढूँढो (Universal)
         cnts = cv2.findContours(thresh_warped.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts = imutils.grab_contours(cnts)
-        
         questionCnts = []
         for c in cnts:
             (x, y, w, h) = cv2.boundingRect(c)
             ar = w / float(h)
-            # फिल्टर: यूनिवर्सल साइज (छोटा गोला भी और बड़ा भी)
+            # फिल्टर: साइज चेक (Standard OMR Bubbles)
             if w >= 16 and h >= 16 and ar >= 0.75 and ar <= 1.25:
                 questionCnts.append(c)
 
-        if not questionCnts:
-            return {"status": "error", "message": "No bubbles found."}
+        if not questionCnts: return {"status": "error", "message": "No bubbles found."}
 
-        # 5. Sorting (पहले ऊपर से नीचे, फिर कॉलम)
+        # Sorting (Top-to-Bottom)
         questionCnts = contours.sort_contours(questionCnts, method="top-to-bottom")[0]
         
-        # 4 कॉलम (Aryabhatta Pattern)
+        # Column Identification
         bbs = [cv2.boundingRect(c) for c in questionCnts]
         zipped = sorted(zip(bbs, questionCnts), key=lambda b: b[0][0]) 
         total_cols = 4
@@ -126,13 +112,10 @@ class HumanBrain:
             col_bubbles = zipped[col_i * bubbles_per_col : (col_i + 1) * bubbles_per_col]
             col_bubbles = sorted(col_bubbles, key=lambda b: b[0][1])
 
-            # 4-4 का ग्रुप (Question)
             for i in range(0, len(col_bubbles), 4):
                 q_pack = col_bubbles[i:i+4]
-                q_pack = sorted(q_pack, key=lambda b: b[0][0]) # A,B,C,D
+                q_pack = sorted(q_pack, key=lambda b: b[0][0]) 
                 
-                # --- PIXEL COMPARISON (Relative Logic) ---
-                # हम "Threshold" नहीं, "Comparison" करेंगे (कौन सबसे ज्यादा भरा है)
                 pixels = []
                 for (bbox, c) in q_pack:
                     mask = np.zeros(thresh_warped.shape, dtype="uint8")
@@ -141,23 +124,31 @@ class HumanBrain:
                     total = cv2.countNonZero(mask)
                     pixels.append(total)
                 
-                # विनर ढूँढो (Winner Takes All)
+                # --- S.P.C. LOGIC (Strict Proctor Code) ---
+                
+                # विनर ढूँढो
                 max_pixels = max(pixels)
                 max_index = pixels.index(max_pixels)
                 
                 detected = "SKIP"
                 
-                # Logic: क्या विनर के पास कम से कम कुछ स्याही है? (Noise Filter)
-                # 300 पिक्सेल = बहुत हल्की स्याही भी चलेगी
-                if max_pixels > 300: 
+                # RULE 1: LAXMAN REKHA (Minimum Ink Check)
+                # अगर विनर के पास 450 पिक्सेल से कम स्याही है, तो उसे खाली मानो।
+                # (यह खाली गोलों को DUAL बनने से रोकेगा)
+                if max_pixels < 450:
+                    detected = "SKIP" 
+                
+                else:
+                    # RULE 2: Winner Valid
                     detected = options_map[max_index]
                     
-                    # Dual Check: क्या दूसरा नंबर वाला भी विनर के करीब है?
+                    # RULE 3: DUAL CHECK (Strict)
+                    # दूसरा गोला तभी देखो जब वह भी 'लक्ष्मण रेखा' (450) पार करे
                     sorted_p = sorted(pixels, reverse=True)
                     second_max = sorted_p[1]
                     
-                    # अगर दूसरा गोला पहले गोले के 90% जितना भरा है, तो डुअल है
-                    if second_max > (max_pixels * 0.9): 
+                    # अगर दूसरा गोला भी 450+ है और पहले के करीब है
+                    if second_max > 450 and second_max > (max_pixels * 0.8):
                         detected = "DUAL"
 
                 results[str(q_num)] = detected
@@ -165,11 +156,10 @@ class HumanBrain:
 
         return {"status": "success", "data": results}
 
-# --- ROUTES ---
 brain = HumanBrain()
 
 @app.route('/')
-def home(): return "Human-Like OMR Vision Active 👁️🧠"
+def home(): return "Strict Proctor OMR (S.P.C) Active 🛡️"
 
 @app.route('/scan', methods=['POST'])
 def scan():
